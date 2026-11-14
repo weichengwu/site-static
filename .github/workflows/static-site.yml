@@ -50,7 +50,7 @@ on:
       ssh-user:
         description: SSH username
         type: string
-        default: ubuntu
+        default: root
       deploy-command:
         description: Absolute path to the server executable accepting the site name and ZIP path
         type: string

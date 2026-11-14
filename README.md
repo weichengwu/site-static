@@ -1,6 +1,6 @@
 # 静态网站发布工作流
 
-在项目中添加 `.github/workflows/deploy.yml`，用 `uses` 引用本仓库的 [static-site.yml](.github/workflows/static-site.yml)。将 `REF` 换成包含这些参数的标签或提交 SHA，按项目的默认分支调整触发分支。
+在项目中添加 `.github/workflows/deploy.yml`，用 `uses` 引用本仓库的 [static-site.yml](.github/workflows/static-site.yml)。按项目的默认分支调整触发分支。
 
 ```yaml
 name: Publish static site
@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   site:
-    uses: weichengwu/site-static/.github/workflows/static-site.yml@REF
+    uses: weichengwu/site-static/.github/workflows/static-site.yml@v2
     with:
       deploy-runner: site-deploy
       deploy-host: deploy.example.com
@@ -39,7 +39,7 @@ jobs:
 | `deploy` | `true` | 设为 `false` 时只安装依赖、构建和校验 |
 | `deploy-runner` | 空 | 执行发布的 runner 标签 |
 | `deploy-host` | 空 | SSH 服务器的主机名或 IPv4 地址 |
-| `ssh-user` | `ubuntu` | SSH 用户名 |
+| `ssh-user` | `root` | SSH 用户名 |
 | `deploy-command` | `/usr/local/bin/deploy-static-site` | 服务器上的可执行文件路径，接收站点名和 ZIP 路径 |
 
 npm 使用 `npm ci`，pnpm 使用 `pnpm install --frozen-lockfile`。pnpm 版本由项目的 `package.json` 声明。
@@ -52,7 +52,7 @@ npm 使用 `npm ci`，pnpm 使用 `pnpm install --frozen-lockfile`。pnpm 版本
 ```yaml
 jobs:
   site:
-    uses: weichengwu/site-static/.github/workflows/static-site.yml@REF
+    uses: weichengwu/site-static/.github/workflows/static-site.yml@v2
     with:
       deploy-runner: site-deploy
       deploy-host: deploy.example.com

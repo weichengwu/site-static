@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# != 2 || ! "$1" =~ ^[a-z0-9][a-z0-9-]*$ || ! -f "$2" ]]; then
+  echo 'Usage: deploy-static-site SITE ZIP_PATH' >&2
+  exit 2
+fi
+
+site=$1
+archive=$2
+publish_root=/var/www
+current="$publish_root/$site"
+
+exec 9>"$publish_root/.$site.deploy.lock"
+flock -w 60 9
+
+workspace=$(mktemp -d "$publish_root/.$site.XXXXXXXXXX")
+candidate="$workspace/candidate"
+previous="$workspace/previous"
+
+cleanup() {
+  if [[ -e "$previous" || -L "$previous" ]]; then
+    if [[ ! -e "$current" && ! -L "$current" ]]; then
+      if ! mv -T -- "$previous" "$current"; then
+        echo "Could not restore the previous release. It is available at $previous" >&2
+        return 1
+      fi
+    fi
+  fi
+  rm -rf -- "$workspace"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+mkdir "$candidate"
+unzip -q "$archive" -d "$candidate"
+if [[ ! -s "$candidate/dist/index.html" ]]; then
+  echo 'The deployment ZIP must contain a non-empty dist/index.html' >&2
+  exit 1
+fi
+chmod 755 "$candidate"
+
+if [[ -e "$current" || -L "$current" ]]; then
+  mv -T -- "$current" "$previous"
+fi
+mv -T -- "$candidate" "$current"
+echo "Published $site to $current/dist"

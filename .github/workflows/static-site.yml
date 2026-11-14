@@ -1,0 +1,257 @@
+name: Publish static site
+
+on:
+  workflow_call:
+    inputs:
+      output-dir:
+        description: Build output directory relative to the build working directory
+        type: string
+        default: dist
+      working-directory:
+        description: Project directory relative to the repository root
+        type: string
+        default: .
+      package-manager:
+        description: auto, npm or pnpm
+        type: string
+        default: auto
+      node-version:
+        description: Node.js version
+        type: string
+        default: '24'
+      build-script:
+        description: Script name in package.json
+        type: string
+        default: build
+      build-env:
+        description: JSON object with string-valued environment variables for the build script
+        type: string
+        default: '{}'
+      required-files:
+        description: Extra non-empty output files to verify, one relative path per line
+        type: string
+        default: ''
+      site-name:
+        description: Server site identifier. Defaults to the repository name.
+        type: string
+        default: ''
+      deploy:
+        description: Whether to publish when building the repository's default branch
+        type: boolean
+        default: true
+      deploy-command:
+        description: Absolute path to the server executable accepting the site name and ZIP path
+        type: string
+        default: /usr/local/bin/deploy-static-site
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  site:
+    runs-on: >-
+      ${{ inputs.deploy && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+          && vars.STATIC_SITE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    concurrency:
+      group: static-site-${{ inputs.site-name || github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      PROJECT_DIR: ${{ inputs.working-directory }}
+      OUTPUT_DIR: ${{ inputs.output-dir }}
+      PACKAGE_MANAGER: ${{ inputs.package-manager }}
+      SITE_NAME: ${{ inputs.site-name }}
+      DEPLOY_COMMAND: ${{ inputs.deploy-command }}
+      DEPLOY_HOST: ${{ vars.STATIC_SITE_DEPLOY_HOST }}
+      DEPLOY_RUNNER: ${{ vars.STATIC_SITE_RUNNER }}
+      SSH_USER: ${{ vars.STATIC_SITE_SSH_USER || 'ubuntu' }}
+      PUBLISH: ${{ inputs.deploy && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Resolve site settings
+        id: config
+        run: |
+          for path in "$PROJECT_DIR" "$OUTPUT_DIR"; do
+            if [[ -z "$path" || "$path" == /* || "/$path/" == */../* || "$path" == *[[:cntrl:]]* ]]; then
+              echo "::error::working-directory and output-dir must be relative paths within the project"
+              exit 1
+            fi
+          done
+
+          manager=$PACKAGE_MANAGER
+          if [[ "$manager" == auto ]]; then
+            if [[ -f "$PROJECT_DIR/pnpm-lock.yaml" && -f "$PROJECT_DIR/package-lock.json" ]]; then
+              echo "::error::Both lockfiles exist. Set package-manager to npm or pnpm."
+              exit 1
+            elif [[ -f "$PROJECT_DIR/pnpm-lock.yaml" ]]; then
+              manager=pnpm
+            elif [[ -f "$PROJECT_DIR/package-lock.json" ]]; then
+              manager=npm
+            else
+              echo "::error::Expected pnpm-lock.yaml or package-lock.json in $PROJECT_DIR"
+              exit 1
+            fi
+          fi
+          case "$manager" in
+            pnpm) lockfile="$PROJECT_DIR/pnpm-lock.yaml" ;;
+            npm) lockfile="$PROJECT_DIR/package-lock.json" ;;
+            *)
+              echo '::error::package-manager must be auto, pnpm or npm'
+              exit 1
+              ;;
+          esac
+          test -f "$lockfile" || { echo "::error::Missing lockfile: $lockfile"; exit 1; }
+
+          if [[ "$PUBLISH" == true ]]; then
+            site=${SITE_NAME:-${GITHUB_REPOSITORY##*/}}
+            if [[ ! "$site" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+              echo "::error::Set site-name to lowercase letters, numbers or hyphens"
+              exit 1
+            fi
+            if [[ -z "$DEPLOY_RUNNER" ]]; then
+              echo "::error::Set STATIC_SITE_RUNNER to the runner label configured for SSH deployment"
+              exit 1
+            fi
+            if [[ ! "$DEPLOY_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]; then
+              echo "::error::Set STATIC_SITE_DEPLOY_HOST to the SSH hostname or IPv4 address"
+              exit 1
+            fi
+            if [[ ! "$SSH_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_.-]*$ ]]; then
+              echo "::error::STATIC_SITE_SSH_USER must be a valid SSH username"
+              exit 1
+            fi
+            if [[ ! "$DEPLOY_COMMAND" =~ ^(/[a-zA-Z0-9._-]+)+$ ]]; then
+              echo "::error::deploy-command must be the absolute path to a server executable"
+              exit 1
+            fi
+            {
+              echo "site=$site"
+              echo "remote=$SSH_USER@$DEPLOY_HOST"
+            } >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "manager=$manager"
+            echo "lockfile=$lockfile"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v6
+        if: steps.config.outputs.manager == 'pnpm'
+        with:
+          package_json_file: ${{ inputs.working-directory }}/package.json
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ steps.config.outputs.manager }}
+          cache-dependency-path: ${{ steps.config.outputs.lockfile }}
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MANAGER: ${{ steps.config.outputs.manager }}
+        run: |
+          if [[ "$MANAGER" == npm ]]; then
+            npm ci
+          else
+            pnpm install --frozen-lockfile
+          fi
+
+      - name: Build and package
+        id: package
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MANAGER: ${{ steps.config.outputs.manager }}
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+          BUILD_ENV_JSON: ${{ inputs.build-env }}
+          REQUIRED_FILES: ${{ inputs.required-files }}
+        run: |
+          node <<'NODE'
+          const { spawnSync } = require('node:child_process');
+
+          const buildEnv = JSON.parse(process.env.BUILD_ENV_JSON);
+          if (!buildEnv || Array.isArray(buildEnv) || typeof buildEnv !== 'object'
+              || Object.entries(buildEnv).some(([key, value]) =>
+                !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof value !== 'string' || value.includes('\0'))) {
+            throw new Error('build-env must be a JSON object of environment variable names and string values');
+          }
+
+          const script = process.env.BUILD_SCRIPT;
+          if (!/^[A-Za-z0-9_][A-Za-z0-9_:.-]*$/.test(script)) {
+            throw new Error('build-script must name a script in package.json');
+          }
+          const result = spawnSync(process.env.MANAGER, ['run', script], {
+            env: { ...process.env, ...buildEnv },
+            stdio: 'inherit',
+          });
+          if (result.error) throw result.error;
+          process.exitCode = result.status ?? 1;
+          NODE
+
+          while IFS= read -r file; do
+            [[ -n "$file" ]] || continue
+            if [[ "$file" == /* || "/$file/" == */../* || "$file" == *[[:cntrl:]]* ]]; then
+              echo "::error::required-files must list paths relative to output-dir"
+              exit 1
+            fi
+            if [[ ! -f "$OUTPUT_DIR/$file" || ! -s "$OUTPUT_DIR/$file" ]]; then
+              echo "::error::Expected a non-empty $OUTPUT_DIR/$file"
+              exit 1
+            fi
+          done <<< $'index.html\n'"$REQUIRED_FILES"
+
+          if [[ "$PUBLISH" == true ]]; then
+            workspace=$(mktemp -d "$RUNNER_TEMP/static-site.XXXXXXXXXX")
+            echo "workspace=$workspace" >> "$GITHUB_OUTPUT"
+            mkdir "$workspace/dist"
+            cp -R "./$OUTPUT_DIR/." "$workspace/dist/"
+            (cd "$workspace" && zip -qr site.zip dist)
+          fi
+
+      - name: Copy package to server
+        id: upload
+        if: env.PUBLISH == 'true'
+        env:
+          REMOTE: ${{ steps.config.outputs.remote }}
+          WORKSPACE: ${{ steps.package.outputs.workspace }}
+        run: |
+          remote_dir=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes "$REMOTE" \
+            mktemp -d /tmp/static-site.XXXXXXXXXX)
+          [[ "$remote_dir" =~ ^/tmp/static-site\.[a-zA-Z0-9]{10}$ ]]
+          echo "directory=$remote_dir" >> "$GITHUB_OUTPUT"
+          scp -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$WORKSPACE/site.zip" "$REMOTE:$remote_dir/site.zip"
+
+      - name: Run server deploy command
+        if: env.PUBLISH == 'true'
+        env:
+          REMOTE: ${{ steps.config.outputs.remote }}
+          REMOTE_DIR: ${{ steps.upload.outputs.directory }}
+          SITE: ${{ steps.config.outputs.site }}
+        run: |
+          ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes "$REMOTE" \
+            "$DEPLOY_COMMAND" "$SITE" "$REMOTE_DIR/site.zip"
+
+      - name: Clean temporary packages
+        if: always()
+        env:
+          REMOTE: ${{ steps.config.outputs.remote }}
+          REMOTE_DIR: ${{ steps.upload.outputs.directory }}
+          WORKSPACE: ${{ steps.package.outputs.workspace }}
+        run: |
+          if [[ "$WORKSPACE" == "$RUNNER_TEMP"/static-site.* ]]; then
+            rm -rf -- "$WORKSPACE"
+          fi
+          if [[ "$REMOTE_DIR" =~ ^/tmp/static-site\.[a-zA-Z0-9]{10}$ ]]; then
+            if ! ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes "$REMOTE" \
+              rm -rf -- "$REMOTE_DIR"; then
+              echo "::warning::Could not clean remote temporary directory $REMOTE_DIR"
+            fi
+          fi
